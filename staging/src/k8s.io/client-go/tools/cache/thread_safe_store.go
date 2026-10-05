@@ -264,6 +264,10 @@ type threadSafeMap struct {
 	// metrics is used to expose metrics about the store
 	// and must be non-nil. If not provided, a noop implementation will be used.
 	metrics *storeMetrics
+
+	// codec packs/unpacks *unstructured.Unstructured objects at rest and must
+	// be non-nil. If not provided, a default CBOR/no-compression codec is used.
+	codec *storeCodec
 }
 
 func (c *threadSafeMap) Transaction(txns ...ThreadSafeStoreTransaction) {
@@ -323,9 +327,9 @@ func (c *threadSafeMap) Update(key string, obj interface{}) {
 func (c *threadSafeMap) updateLocked(key string, obj interface{}) {
 	var oldObject interface{}
 	if stored, exists := c.items[key]; exists {
-		oldObject = cborDecodeObj(key, stored)
+		oldObject = c.codec.decode(key, stored)
 	}
-	c.items[key] = cborEncodeObj(key, obj)
+	c.items[key] = c.codec.encode(key, obj)
 	c.index.updateIndices(oldObject, obj, key)
 }
 
@@ -354,7 +358,7 @@ func (c *threadSafeMap) DeleteWithObject(key string, obj interface{}) {
 
 func (c *threadSafeMap) deleteLocked(key string) {
 	if stored, exists := c.items[key]; exists {
-		c.index.updateIndices(cborDecodeObj(key, stored), nil, key)
+		c.index.updateIndices(c.codec.decode(key, stored), nil, key)
 		delete(c.items, key)
 	}
 }
@@ -366,7 +370,7 @@ func (c *threadSafeMap) Get(key string) (item interface{}, exists bool) {
 	if !exists {
 		return nil, false
 	}
-	return cborDecodeObj(key, stored), true
+	return c.codec.decode(key, stored), true
 }
 
 func (c *threadSafeMap) List() []interface{} {
@@ -374,7 +378,7 @@ func (c *threadSafeMap) List() []interface{} {
 	defer c.lock.RUnlock()
 	list := make([]interface{}, 0, len(c.items))
 	for key, stored := range c.items {
-		list = append(list, cborDecodeObj(key, stored))
+		list = append(list, c.codec.decode(key, stored))
 	}
 	return list
 }
@@ -401,7 +405,7 @@ func (c *threadSafeMap) Replace(items map[string]interface{}, resourceVersion st
 	defer c.lock.Unlock()
 	newItems := make(map[string]interface{}, len(items))
 	for key, item := range items {
-		newItems[key] = cborEncodeObj(key, item)
+		newItems[key] = c.codec.encode(key, item)
 	}
 	c.items = newItems
 	c.rv = resourceVersion
@@ -436,7 +440,7 @@ func (c *threadSafeMap) Index(indexName string, obj interface{}) ([]interface{},
 
 	list := make([]interface{}, 0, storeKeySet.Len())
 	for storeKey := range storeKeySet {
-		list = append(list, cborDecodeObj(storeKey, c.items[storeKey]))
+		list = append(list, c.codec.decode(storeKey, c.items[storeKey]))
 	}
 	return list, nil
 }
@@ -478,7 +482,7 @@ func (c *threadSafeMap) ByIndex(indexName, indexedValue string) ([]interface{}, 
 	}
 	list := make([]interface{}, 0, set.Len())
 	for key := range set {
-		list = append(list, cborDecodeObj(key, c.items[key]))
+		list = append(list, c.codec.decode(key, c.items[key]))
 	}
 
 	return list, nil
@@ -517,7 +521,7 @@ func (c *threadSafeMap) AddIndexers(newIndexers Indexers) error {
 	}
 
 	for key, stored := range c.items {
-		item := cborDecodeObj(key, stored)
+		item := c.codec.decode(key, stored)
 		for name := range newIndexers {
 			c.index.updateSingleIndex(name, nil, item, key)
 		}
@@ -544,6 +548,9 @@ func NewThreadSafeStore(indexers Indexers, indices Indices, opts ...ThreadSafeSt
 	}
 	if store.metrics == nil {
 		store.metrics = newStoreMetrics(InformerNameAndResource{}, noopInformerMetricsProvider{})
+	}
+	if store.codec == nil {
+		store.codec = newStoreCodec(SerializationCBOR, CompressionNone)
 	}
 	return store
 }

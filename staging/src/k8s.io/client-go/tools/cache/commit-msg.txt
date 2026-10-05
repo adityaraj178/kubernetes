@@ -1,0 +1,101 @@
+client-go/cache: encode *unstructured.Unstructured at rest as CBOR in ThreadSafeStore
+
+Problem
+-------
+ThreadSafeStore (the backing store for every informer cache) holds all
+objects as fully-deserialized Go values in map[string]interface{}.  A
+*unstructured.Unstructured is a deeply-nested map[string]interface{} tree
+where every field — strings, numbers, nested maps — is a separately-boxed,
+individually GC-tracked heap allocation.  For controllers managing thousands
+of unstructured resources this dominates process memory.
+
+Real-world impact (argoproj/argo-cd#26897): 3000 Application objects in an
+Argo CD informer cache; gzip compression at rest cut memory by ~55% with
+only 0.2–0.4 additional CPU cores.  The same problem affects any operator
+managing CRDs at scale: Flux, kube-state-metrics, custom controllers.
+
+Measured baseline in this repo: 3000 Pod-sized *unstructured.Unstructured
+objects held live in a ThreadSafeStore → ~17.8 MB heap.
+
+Solution
+--------
+Automatically encode *unstructured.Unstructured objects as CBOR binary blobs
+at rest inside the backing map.  No configuration, no opt-in, no API change.
+Non-unstructured objects (typed structs, strings, etc.) pass through
+unchanged, preserving full backwards compatibility for every existing caller.
+
+Implementation
+--------------
+thread_safe_store_cbor.go (new file):
+
+  cborEncoded{data []byte}
+    Named wrapper type for the at-rest form.  Using a named type rather than
+    raw []byte prevents ambiguity: any []byte a caller stores passes through
+    unchanged; only values produced by cborEncodeObj carry this wrapper.
+
+  cborDecMode
+    Package-level CBOR DecMode configured with
+    DefaultMapType=map[string]interface{}.  Without this option fxamacker/cbor
+    decodes maps inside interface{} values as map[interface{}]interface{},
+    which silently breaks unstructured field accessors such as GetName().
+
+  cborEncodeObj(key, obj)
+    Encodes *unstructured.Unstructured to a cborEncoded blob.  Returns obj
+    unchanged for any other type.  On encode failure logs a warning and
+    returns the original object — codec errors degrade memory savings, not
+    correctness.
+
+  cborDecodeObj(key, stored)
+    Decodes a cborEncoded blob back to *unstructured.Unstructured.  Returns
+    stored unchanged for any other type.  On decode failure logs and returns
+    the stored value as-is.
+
+Both helpers are wired into every path that reads from or writes to items:
+updateLocked, deleteLocked, Get, List, Index, ByIndex, Replace, AddIndexers.
+Indexers always receive the decoded object, never the at-rest blob.
+
+Why CBOR
+--------
+Four formats were benchmarked (3000 Pod-sized *unstructured.Unstructured,
+store holds the only reference, source objects not retained by caller):
+
+  Format          payload/obj   live heap   heap saved   decode ns   list-1k ms
+  ──────────────────────────────────────────────────────────────────────────────
+  identity        ~1603 B       17,758 KB   baseline     4 ns        0.0 ms
+  json (no gzip)   1603 B        5,318 KB   -70%         43 µs       31.4 ms
+  msgpack          1430 B        6,070 KB   -65%         15 µs       15.4 ms
+  cbor             1432 B        4,560 KB   -74%         18 µs       21.7 ms
+  json+gzip         507 B        1,567 KB   -91%         71 µs       88.1 ms
+
+CBOR was chosen over the alternatives for these reasons:
+
+  vs json+gzip  — gzip achieves 91% heap reduction vs CBOR's 74%, but its
+    read latency (71 µs/obj) and list cost (88 ms / 1000 objects) are 4–6x
+    higher than CBOR.  Controllers that resync or list their cache frequently
+    (reconcile loops, reflector resyncs) would pay that cost on every cycle.
+    The extra 17 percentage points of memory savings is not worth a 4x
+    slowdown on the read path for general-purpose use.
+
+  vs msgpack    — msgpack is marginally faster than CBOR (~15 µs vs 18 µs
+    decode) but saves less heap (65% vs 74%) and is not vendored in the
+    kubernetes repo.  Adding a new external dependency for a 3 µs/object
+    latency difference is not justified.
+
+  vs json (no compression) — 3 µs faster to decode than CBOR but saves 4%
+    less heap.  No reason to prefer it.
+
+  vs identity   — baseline; included for reference.
+
+CBOR is already a first-class wire format in the Kubernetes API server
+(added in 1.32 via fxamacker/cbor/v2) and is a declared dependency of
+client-go.  No new dependency is introduced.
+
+Benchmark results (this PR)
+---------------------------
+  TestCBORHeapReduction  — 3000 Pods, store holds only reference:
+    live heap before : ~17,766 KB
+    live heap after  :  ~4,741 KB  (~73% reduction)
+
+  BenchmarkCBORWrite :  ~9,600 ns/op   ~200 allocs/op
+  BenchmarkCBORRead  : ~17,000 ns/op   ~200 allocs/op
+  BenchmarkCBORList  :     ~22 ms / 1000 objects

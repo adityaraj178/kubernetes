@@ -348,7 +348,7 @@ func TestThreadSafeStoreCodecRoundTrip(t *testing.T) {
 	store.Add("key1", pod1)
 	store.Add("key2", pod2)
 
-	if _, ok := store.items["key1"].(cborEncoded); !ok {
+	if _, ok := store.items["key1"].(encodedObject); !ok {
 		t.Fatalf("expected key1 stored as []byte, got %T", store.items["key1"])
 	}
 
@@ -418,7 +418,7 @@ func TestThreadSafeStoreCodecReplace(t *testing.T) {
 		"key2": makeCBORTestPod("bar", "default"),
 	}, "10")
 
-	if _, ok := store.items["key1"].(cborEncoded); !ok {
+	if _, ok := store.items["key1"].(encodedObject); !ok {
 		t.Fatalf("expected key1 stored as []byte after Replace, got %T", store.items["key1"])
 	}
 	got, exists := store.Get("key1")
@@ -430,6 +430,47 @@ func TestThreadSafeStoreCodecReplace(t *testing.T) {
 	}
 	if res, _ := store.ByIndex("byName", "bar"); len(res) != 1 {
 		t.Errorf("ByIndex(bar) after Replace = %v, want 1 result", res)
+	}
+}
+
+// TestThreadSafeStoreCodecCombinations verifies that every supported
+// serialization/compression pair round-trips a *unstructured.Unstructured
+// object, including nested maps and int64 fields, without loss.
+func TestThreadSafeStoreCodecCombinations(t *testing.T) {
+	serializations := []SerializationFormat{SerializationCBOR, SerializationJSON, SerializationMsgpack}
+	compressions := []CompressionAlgorithm{CompressionNone, CompressionGzip, CompressionGzipBestSpeed, CompressionDeflate, CompressionS2}
+
+	for _, ser := range serializations {
+		for _, comp := range compressions {
+			t.Run(string(ser)+"/"+string(comp), func(t *testing.T) {
+				store := NewThreadSafeStore(Indexers{}, Indices{}, WithThreadSafeStoreCodec(ser, comp)).(*threadSafeMap)
+				pod := makeBenchPod(0)
+				store.Add("default/pod", pod)
+
+				if _, ok := store.items["default/pod"].(encodedObject); !ok {
+					t.Fatalf("expected item stored as encodedObject, got %T", store.items["default/pod"])
+				}
+
+				got, exists := store.Get("default/pod")
+				if !exists {
+					t.Fatal("Get: not found")
+				}
+				u, ok := got.(*unstructured.Unstructured)
+				if !ok {
+					t.Fatalf("Get returned %T, want *unstructured.Unstructured", got)
+				}
+				if diff := cmp.Diff(pod.Object, u.Object); diff != "" {
+					t.Errorf("round-tripped object differs (-want +got):\n%s", diff)
+				}
+				spec := u.Object["spec"].(map[string]interface{})
+				containers := spec["containers"].([]interface{})
+				ports := containers[0].(map[string]interface{})["ports"].([]interface{})
+				port := ports[0].(map[string]interface{})["containerPort"]
+				if _, ok := port.(int64); !ok {
+					t.Errorf("containerPort type = %T, want int64 (got %v)", port, port)
+				}
+			})
+		}
 	}
 }
 
